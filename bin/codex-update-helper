@@ -1,0 +1,518 @@
+#!/bin/zsh
+
+set -u
+setopt NULL_GLOB
+
+readonly TOOL_NAME="codex-update-helper"
+readonly TOOL_VERSION="0.1.0"
+
+readonly APP_PATH="${CODEX_UPDATE_HELPER_APP_PATH:-/Applications/ChatGPT.app}"
+readonly APP_INFO="$APP_PATH/Contents/Info.plist"
+readonly APP_NAME="${APP_PATH:t}"
+readonly BUNDLE_ID="${CODEX_UPDATE_HELPER_BUNDLE_ID:-com.openai.codex}"
+readonly APP_PROCESS="${CODEX_UPDATE_HELPER_PROCESS_NAME:-ChatGPT}"
+readonly APP_EXECUTABLE="${CODEX_UPDATE_HELPER_EXECUTABLE_PATH:-$APP_PATH/Contents/MacOS/$APP_PROCESS}"
+readonly EXPECTED_TEAM_ID="${CODEX_UPDATE_HELPER_EXPECTED_TEAM_ID:-2DC432GLL2}"
+readonly SPARKLE_INSTALL_DIR="${CODEX_UPDATE_HELPER_SPARKLE_DIR:-$HOME/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle/Installation}"
+readonly MIN_IDLE_SECONDS="${CODEX_UPDATE_HELPER_MIN_IDLE_SECONDS:-900}"
+readonly MAX_WAIT_SECONDS="${CODEX_UPDATE_HELPER_MAX_WAIT_SECONDS:-600}"
+readonly POLL_SECONDS="${CODEX_UPDATE_HELPER_POLL_SECONDS:-5}"
+readonly SKIP_SIGNATURE_CHECK="${CODEX_UPDATE_HELPER_SKIP_SIGNATURE_CHECK:-0}"
+readonly SERVICE_LABEL="dev.exprmntl.codex-update-helper"
+readonly LOCK_DIR="${TMPDIR:-/tmp}/${TOOL_NAME}-${UID}.lock"
+
+DRY_RUN=false
+FORCE=false
+LOCK_HELD=false
+STAGED_APP=""
+STAGED_INFO=""
+STAGED_BUILD=0
+STAGED_VERSION=""
+
+timestamp() {
+  /bin/date '+%Y-%m-%d %H:%M:%S %Z'
+}
+
+log_info() {
+  /bin/echo "$(timestamp) $*"
+}
+
+log_error() {
+  /bin/echo "$(timestamp) ERROR: $*" >&2
+}
+
+usage() {
+  /bin/cat <<'USAGE'
+Usage:
+  codex-update-helper run [--dry-run] [--force]
+  codex-update-helper status
+  codex-update-helper doctor
+  codex-update-helper version
+  codex-update-helper help
+
+Commands:
+  run       Enable Codex automatic updates and install a signed staged update.
+  status    Show installed, staged, preference, process, and service state.
+  doctor    Validate the app, signatures, updater cache, and service setup.
+
+Options for run:
+  --dry-run Show what would happen without changing preferences or quitting Codex.
+  --force   Bypass the idle-time guard. Signature and identity checks still apply.
+USAGE
+}
+
+read_plist_value() {
+  local plist_path=$1
+  local key=$2
+  /usr/bin/plutil -extract "$key" raw "$plist_path" 2>/dev/null
+}
+
+is_integer() {
+  [[ ${1:-} == <-> ]]
+}
+
+installed_bundle_id() {
+  read_plist_value "$APP_INFO" CFBundleIdentifier
+}
+
+installed_build() {
+  read_plist_value "$APP_INFO" CFBundleVersion
+}
+
+installed_version() {
+  read_plist_value "$APP_INFO" CFBundleShortVersionString
+}
+
+app_build_at() {
+  local app_path=$1
+  read_plist_value "$app_path/Contents/Info.plist" CFBundleVersion
+}
+
+app_version_at() {
+  local app_path=$1
+  read_plist_value "$app_path/Contents/Info.plist" CFBundleShortVersionString
+}
+
+app_bundle_id_at() {
+  local app_path=$1
+  read_plist_value "$app_path/Contents/Info.plist" CFBundleIdentifier
+}
+
+team_id_at() {
+  local app_path=$1
+  /usr/bin/codesign -dvvv "$app_path" 2>&1 \
+    | /usr/bin/awk -F= '/^TeamIdentifier=/{print $2; exit}'
+}
+
+verify_app_identity() {
+  local app_path=$1
+  local description=$2
+  local actual_bundle
+  actual_bundle=$(app_bundle_id_at "$app_path" 2>/dev/null || true)
+
+  if [[ $actual_bundle != "$BUNDLE_ID" ]]; then
+    log_error "$description has bundle ID '${actual_bundle:-unreadable}', expected '$BUNDLE_ID'."
+    return 1
+  fi
+
+  if [[ $SKIP_SIGNATURE_CHECK == 1 ]]; then
+    log_info "Skipping signature validation for $description because the test override is enabled."
+    return 0
+  fi
+
+  local actual_team
+  actual_team=$(team_id_at "$app_path" 2>/dev/null || true)
+  if [[ $actual_team != "$EXPECTED_TEAM_ID" ]]; then
+    log_error "$description has signing team '${actual_team:-unreadable}', expected '$EXPECTED_TEAM_ID'."
+    return 1
+  fi
+
+  if ! /usr/bin/codesign --verify --deep --strict "$app_path" >/dev/null 2>&1; then
+    log_error "$description failed strict code-signature verification."
+    return 1
+  fi
+}
+
+find_newest_staged_update() {
+  STAGED_APP=""
+  STAGED_INFO=""
+  STAGED_BUILD=0
+  STAGED_VERSION=""
+
+  local candidate_info candidate_build candidate_version candidate_app
+  for candidate_info in "$SPARKLE_INSTALL_DIR"/**/"$APP_NAME"/Contents/Info.plist(N); do
+    candidate_build=$(read_plist_value "$candidate_info" CFBundleVersion 2>/dev/null || true)
+    candidate_version=$(read_plist_value "$candidate_info" CFBundleShortVersionString 2>/dev/null || true)
+    candidate_app=${candidate_info%/Contents/Info.plist}
+
+    if is_integer "$candidate_build" && (( candidate_build > STAGED_BUILD )); then
+      STAGED_APP=$candidate_app
+      STAGED_INFO=$candidate_info
+      STAGED_BUILD=$candidate_build
+      STAGED_VERSION=$candidate_version
+    fi
+  done
+}
+
+is_app_running() {
+  if [[ -n ${CODEX_UPDATE_HELPER_RUNNING_OVERRIDE:-} ]]; then
+    [[ $CODEX_UPDATE_HELPER_RUNNING_OVERRIDE == 1 ]]
+    return
+  fi
+  # -a includes ancestor processes, which matters when the command is run
+  # from Codex's own integrated terminal or automation environment.
+  /usr/bin/pgrep -a -f -x "$APP_EXECUTABLE" >/dev/null 2>&1
+}
+
+idle_seconds() {
+  if [[ -n ${CODEX_UPDATE_HELPER_IDLE_SECONDS_OVERRIDE:-} ]]; then
+    /bin/echo "$CODEX_UPDATE_HELPER_IDLE_SECONDS_OVERRIDE"
+    return 0
+  fi
+
+  local idle_ns
+  idle_ns=$(/usr/sbin/ioreg -r -c IOHIDSystem 2>/dev/null \
+    | /usr/bin/awk '/"HIDIdleTime"/ {print $NF; exit}')
+  if ! is_integer "$idle_ns"; then
+    return 1
+  fi
+  /bin/echo $(( idle_ns / 1000000000 ))
+}
+
+read_preference() {
+  local key=$1
+  /usr/bin/defaults read "$BUNDLE_ID" "$key" 2>/dev/null
+}
+
+enable_automatic_updates() {
+  local key current
+  for key in SUEnableAutomaticChecks SUAutomaticallyUpdate; do
+    current=$(read_preference "$key" || true)
+    if [[ $current == 1 ]]; then
+      continue
+    fi
+
+    if [[ $DRY_RUN == true ]]; then
+      log_info "Would enable Codex preference $key."
+    elif /usr/bin/defaults write "$BUNDLE_ID" "$key" -bool true; then
+      log_info "Enabled Codex preference $key."
+    else
+      log_error "Could not enable Codex preference $key."
+      return 1
+    fi
+  done
+}
+
+service_is_loaded() {
+  /bin/launchctl print "gui/$UID/$SERVICE_LABEL" >/dev/null 2>&1
+}
+
+release_lock() {
+  if [[ $LOCK_HELD == true ]]; then
+    /bin/rm -f "$LOCK_DIR/pid"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=false
+  fi
+}
+
+acquire_lock() {
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    /bin/echo $$ > "$LOCK_DIR/pid"
+    LOCK_HELD=true
+    return 0
+  fi
+
+  local existing_pid=""
+  if [[ -r "$LOCK_DIR/pid" ]]; then
+    existing_pid=$(<"$LOCK_DIR/pid")
+  fi
+  if is_integer "$existing_pid" && /bin/kill -0 "$existing_pid" 2>/dev/null; then
+    log_info "Another update check is already running as process $existing_pid."
+    return 1
+  fi
+
+  /bin/rm -f "$LOCK_DIR/pid"
+  /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+  if /bin/mkdir "$LOCK_DIR" 2>/dev/null; then
+    /bin/echo $$ > "$LOCK_DIR/pid"
+    LOCK_HELD=true
+    return 0
+  fi
+
+  log_error "Could not acquire the update lock at $LOCK_DIR."
+  return 1
+}
+
+poll_count() {
+  local max_wait=$MAX_WAIT_SECONDS
+  local poll=$POLL_SECONDS
+  if ! is_integer "$max_wait" || ! is_integer "$poll" || (( poll == 0 )); then
+    /bin/echo 1
+    return
+  fi
+  local count=$(( max_wait / poll ))
+  (( count < 1 )) && count=1
+  /bin/echo "$count"
+}
+
+open_app_if_needed() {
+  local was_running=$1
+  if [[ $was_running == true ]] && ! is_app_running; then
+    if /usr/bin/open -a "$APP_PATH"; then
+      log_info "Reopened Codex."
+    else
+      log_error "The update finished, but Codex could not be reopened."
+      return 1
+    fi
+  fi
+}
+
+run_update() {
+  while (( $# > 0 )); do
+    case $1 in
+      --dry-run) DRY_RUN=true ;;
+      --force) FORCE=true ;;
+      *) log_error "Unknown option: $1"; usage >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  if [[ $(uname -s) != Darwin ]]; then
+    log_error "This utility only supports macOS."
+    return 1
+  fi
+
+  if [[ ! -r $APP_INFO ]]; then
+    log_error "Codex is not installed at $APP_PATH."
+    return 1
+  fi
+
+  local bundle installed_build_value installed_version_value
+  bundle=$(installed_bundle_id 2>/dev/null || true)
+  installed_build_value=$(installed_build 2>/dev/null || true)
+  installed_version_value=$(installed_version 2>/dev/null || true)
+
+  if [[ $bundle != "$BUNDLE_ID" ]]; then
+    log_error "The app at $APP_PATH has bundle ID '${bundle:-unreadable}', expected '$BUNDLE_ID'."
+    return 1
+  fi
+  if ! is_integer "$installed_build_value"; then
+    log_error "Could not read the installed Codex build number."
+    return 1
+  fi
+
+  if ! acquire_lock; then
+    return 0
+  fi
+  trap release_lock EXIT INT TERM HUP
+
+  enable_automatic_updates || return 1
+  find_newest_staged_update
+
+  if (( STAGED_BUILD <= installed_build_value )); then
+    log_info "No staged update is newer than Codex $installed_version_value (build $installed_build_value)."
+    return 0
+  fi
+
+  log_info "Signed-update candidate: Codex $STAGED_VERSION (build $STAGED_BUILD); installed build is $installed_build_value."
+  verify_app_identity "$APP_PATH" "Installed Codex" || return 1
+  verify_app_identity "$STAGED_APP" "Staged Codex update" || return 1
+
+  local was_running=false current_idle
+  if is_app_running; then
+    was_running=true
+    if [[ $FORCE != true ]]; then
+      current_idle=$(idle_seconds 2>/dev/null || true)
+      if ! is_integer "$current_idle"; then
+        log_info "Could not determine keyboard/mouse idle time; deferring the update safely."
+        return 0
+      fi
+      if ! is_integer "$MIN_IDLE_SECONDS" || (( current_idle < MIN_IDLE_SECONDS )); then
+        log_info "Codex is open and the Mac has been idle for ${current_idle}s; deferring until ${MIN_IDLE_SECONDS}s."
+        return 0
+      fi
+    fi
+
+    if [[ $DRY_RUN == true ]]; then
+      log_info "Would request a graceful Codex quit, wait for Sparkle, and reopen Codex."
+      return 0
+    fi
+
+    log_info "Requesting a graceful Codex quit so Sparkle can install the update."
+    /usr/bin/osascript -e 'tell application id "com.openai.codex" to quit' >/dev/null 2>&1 || true
+
+    local attempt current_build_value
+    for attempt in {1..$(poll_count)}; do
+      current_build_value=$(installed_build 2>/dev/null || true)
+      if is_integer "$current_build_value" && (( current_build_value > installed_build_value )); then
+        break
+      fi
+      if ! is_app_running; then
+        break
+      fi
+      /bin/sleep "$POLL_SECONDS"
+    done
+
+    current_build_value=$(installed_build 2>/dev/null || true)
+    if is_app_running \
+        && { ! is_integer "$current_build_value" || (( current_build_value <= installed_build_value )); }; then
+      log_info "Codex did not quit within ${MAX_WAIT_SECONDS}s; deferring without forcing it closed."
+      return 0
+    fi
+  else
+    log_info "Codex is already closed; waiting for Sparkle to finish without reopening it."
+    if [[ $DRY_RUN == true ]]; then
+      log_info "Would wait for Sparkle to finish the staged update."
+      return 0
+    fi
+  fi
+
+  local attempt updated_build=$installed_build_value
+  for attempt in {1..$(poll_count)}; do
+    local candidate_build
+    candidate_build=$(installed_build 2>/dev/null || true)
+    if is_integer "$candidate_build" && (( candidate_build > installed_build_value )); then
+      updated_build=$candidate_build
+      break
+    fi
+    /bin/sleep "$POLL_SECONDS"
+  done
+
+  if (( updated_build > installed_build_value )); then
+    local updated_version
+    updated_version=$(installed_version 2>/dev/null || true)
+    log_info "Updated Codex to $updated_version (build $updated_build)."
+    open_app_if_needed "$was_running"
+  else
+    log_error "Sparkle did not finish within ${MAX_WAIT_SECONDS}s; the existing app was left intact."
+    open_app_if_needed "$was_running" || true
+    return 1
+  fi
+}
+
+show_status() {
+  /bin/echo "$TOOL_NAME $TOOL_VERSION"
+  /bin/echo "App path: $APP_PATH"
+
+  if [[ ! -r $APP_INFO ]]; then
+    /bin/echo "Installed: not found"
+    /bin/echo "Service: $(service_is_loaded && /bin/echo loaded || /bin/echo not-loaded)"
+    return 1
+  fi
+
+  local version build automatic_checks automatic_updates skipped process_state service_state
+  version=$(installed_version 2>/dev/null || /bin/echo unreadable)
+  build=$(installed_build 2>/dev/null || /bin/echo unreadable)
+  automatic_checks=$(read_preference SUEnableAutomaticChecks || /bin/echo unset)
+  automatic_updates=$(read_preference SUAutomaticallyUpdate || /bin/echo unset)
+  skipped=$(read_preference SUSkippedVersion || /bin/echo none)
+  process_state=$(is_app_running && /bin/echo running || /bin/echo closed)
+  service_state=$(service_is_loaded && /bin/echo loaded || /bin/echo not-loaded)
+  find_newest_staged_update
+
+  /bin/echo "Installed: $version (build $build)"
+  if (( STAGED_BUILD > 0 )); then
+    /bin/echo "Staged: $STAGED_VERSION (build $STAGED_BUILD)"
+  else
+    /bin/echo "Staged: none"
+  fi
+  /bin/echo "Automatic checks: $automatic_checks"
+  /bin/echo "Automatic updates: $automatic_updates"
+  /bin/echo "Skipped version: $skipped"
+  /bin/echo "Codex process: $process_state"
+  /bin/echo "Service: $service_state"
+}
+
+doctor_check() {
+  local level=$1
+  shift
+  /bin/echo "[$level] $*"
+}
+
+run_doctor() {
+  local errors=0 warnings=0
+  /bin/echo "$TOOL_NAME doctor"
+
+  if [[ $(uname -s) == Darwin ]]; then
+    doctor_check OK "macOS detected."
+  else
+    doctor_check ERROR "This utility only supports macOS."
+    (( errors++ ))
+  fi
+
+  if [[ -r $APP_INFO ]]; then
+    doctor_check OK "Codex found at $APP_PATH."
+  else
+    doctor_check ERROR "Codex was not found at $APP_PATH."
+    (( errors++ ))
+  fi
+
+  if [[ -r $APP_INFO ]]; then
+    if verify_app_identity "$APP_PATH" "Installed Codex" >/dev/null; then
+      doctor_check OK "Installed Codex has the expected bundle ID and signature."
+    else
+      doctor_check ERROR "Installed Codex identity or signature validation failed."
+      (( errors++ ))
+    fi
+  fi
+
+  if [[ -d $SPARKLE_INSTALL_DIR ]]; then
+    doctor_check OK "Sparkle installation cache is available."
+  else
+    doctor_check WARN "Sparkle has not created its installation cache yet."
+    (( warnings++ ))
+  fi
+
+  find_newest_staged_update
+  if (( STAGED_BUILD > 0 )); then
+    if verify_app_identity "$STAGED_APP" "Staged Codex update" >/dev/null; then
+      doctor_check OK "Staged Codex $STAGED_VERSION (build $STAGED_BUILD) is signed correctly."
+    else
+      doctor_check ERROR "The staged Codex update failed identity or signature validation."
+      (( errors++ ))
+    fi
+  else
+    doctor_check OK "No staged Codex update is waiting."
+  fi
+
+  local checks updates skipped
+  checks=$(read_preference SUEnableAutomaticChecks || /bin/echo unset)
+  updates=$(read_preference SUAutomaticallyUpdate || /bin/echo unset)
+  skipped=$(read_preference SUSkippedVersion || /bin/echo none)
+  if [[ $checks == 1 && $updates == 1 ]]; then
+    doctor_check OK "Codex automatic checks and downloads are enabled."
+  else
+    doctor_check WARN "Automatic update preferences are not both enabled; the next service run will enable them."
+    (( warnings++ ))
+  fi
+  if [[ $skipped != none ]]; then
+    doctor_check WARN "Codex is configured to skip version $skipped; this utility respects that choice."
+    (( warnings++ ))
+  fi
+
+  if service_is_loaded; then
+    doctor_check OK "Homebrew service $SERVICE_LABEL is loaded."
+  else
+    doctor_check WARN "Homebrew service $SERVICE_LABEL is not loaded."
+    (( warnings++ ))
+  fi
+
+  /bin/echo "Doctor finished with $errors error(s) and $warnings warning(s)."
+  (( errors == 0 ))
+}
+
+main() {
+  local command=${1:-run}
+  (( $# > 0 )) && shift
+
+  case $command in
+    run) run_update "$@" ;;
+    status) show_status ;;
+    doctor) run_doctor ;;
+    version|--version|-v) /bin/echo "$TOOL_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) log_error "Unknown command: $command"; usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"
