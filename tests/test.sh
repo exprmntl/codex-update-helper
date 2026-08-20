@@ -59,7 +59,7 @@ run_helper() {
 /bin/zsh -n "$HELPER"
 /bin/echo "ok 1 - zsh syntax"
 
-[[ $("$HELPER" version) == 0.1.0 ]] || fail "unexpected version"
+[[ $("$HELPER" version) == 0.1.1 ]] || fail "unexpected version"
 /bin/echo "ok 2 - version"
 
 help_output=$("$HELPER" help)

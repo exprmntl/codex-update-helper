@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 - 2026-08-20
+
+- Prevent an internal zsh loop variable from leaking into update logs.
+
 ## 0.1.0 - 2026-08-20
 
 - Initial macOS release.

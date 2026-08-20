@@ -4,7 +4,7 @@ set -u
 setopt NULL_GLOB
 
 readonly TOOL_NAME="codex-update-helper"
-readonly TOOL_VERSION="0.1.0"
+readonly TOOL_VERSION="0.1.1"
 
 readonly APP_PATH="${CODEX_UPDATE_HELPER_APP_PATH:-/Applications/ChatGPT.app}"
 readonly APP_INFO="$APP_PATH/Contents/Info.plist"
@@ -268,6 +268,8 @@ open_app_if_needed() {
 }
 
 run_update() {
+  local attempt candidate_build current_build_value updated_build updated_version
+
   while (( $# > 0 )); do
     case $1 in
       --dry-run) DRY_RUN=true ;;
@@ -341,7 +343,6 @@ run_update() {
     log_info "Requesting a graceful Codex quit so Sparkle can install the update."
     /usr/bin/osascript -e 'tell application id "com.openai.codex" to quit' >/dev/null 2>&1 || true
 
-    local attempt current_build_value
     for attempt in {1..$(poll_count)}; do
       current_build_value=$(installed_build 2>/dev/null || true)
       if is_integer "$current_build_value" && (( current_build_value > installed_build_value )); then
@@ -367,9 +368,8 @@ run_update() {
     fi
   fi
 
-  local attempt updated_build=$installed_build_value
+  updated_build=$installed_build_value
   for attempt in {1..$(poll_count)}; do
-    local candidate_build
     candidate_build=$(installed_build 2>/dev/null || true)
     if is_integer "$candidate_build" && (( candidate_build > installed_build_value )); then
       updated_build=$candidate_build
@@ -379,7 +379,6 @@ run_update() {
   done
 
   if (( updated_build > installed_build_value )); then
-    local updated_version
     updated_version=$(installed_version 2>/dev/null || true)
     log_info "Updated Codex to $updated_version (build $updated_build)."
     open_app_if_needed "$was_running"
