@@ -12,6 +12,8 @@
 - Add native time pickers, a searchable timezone dropdown, duration menus, contextual restart guidance, and Restore defaults.
 - Add an original moon/update-arrow app icon, including all macOS icon sizes and Retina variants.
 - Simplify the icon to a flat, editable two-color SVG with no gradients; build the macOS icon directly from the vector source.
+- Refresh the app bundle timestamp during installation so macOS picks up the current icon after an upgrade.
+- Shorten the README with a copy-and-paste Codex setup prompt and settings table; retain detailed instructions in the technical reference.
 
 ## 0.1.1 - 2026-08-20
 

@@ -20,6 +20,8 @@ fi
 /bin/launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 /usr/bin/ditto "$PROJECT_ROOT/build/Codex Update Helper.app" "$APP"
 # Refresh this app's metadata and icon after replacing a local build.
+# ditto preserves the bundle timestamp, which can leave macOS using a stale icon.
+/usr/bin/touch "$APP"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 /usr/bin/plutil -create xml1 "$PLIST"
 /usr/bin/plutil -insert Label -string "$LABEL" "$PLIST"
