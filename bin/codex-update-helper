@@ -4,7 +4,7 @@ set -u
 setopt NULL_GLOB
 
 readonly TOOL_NAME="codex-update-helper"
-readonly TOOL_VERSION="0.1.1"
+readonly TOOL_VERSION="0.2.0"
 
 readonly APP_PATH="${CODEX_UPDATE_HELPER_APP_PATH:-/Applications/ChatGPT.app}"
 readonly APP_INFO="$APP_PATH/Contents/Info.plist"
@@ -14,15 +14,25 @@ readonly APP_PROCESS="${CODEX_UPDATE_HELPER_PROCESS_NAME:-ChatGPT}"
 readonly APP_EXECUTABLE="${CODEX_UPDATE_HELPER_EXECUTABLE_PATH:-$APP_PATH/Contents/MacOS/$APP_PROCESS}"
 readonly EXPECTED_TEAM_ID="${CODEX_UPDATE_HELPER_EXPECTED_TEAM_ID:-2DC432GLL2}"
 readonly SPARKLE_INSTALL_DIR="${CODEX_UPDATE_HELPER_SPARKLE_DIR:-$HOME/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle/Installation}"
-readonly MIN_IDLE_SECONDS="${CODEX_UPDATE_HELPER_MIN_IDLE_SECONDS:-900}"
+MIN_IDLE_SECONDS="${CODEX_UPDATE_HELPER_MIN_IDLE_SECONDS:-900}"
 readonly MAX_WAIT_SECONDS="${CODEX_UPDATE_HELPER_MAX_WAIT_SECONDS:-600}"
 readonly POLL_SECONDS="${CODEX_UPDATE_HELPER_POLL_SECONDS:-5}"
 readonly SKIP_SIGNATURE_CHECK="${CODEX_UPDATE_HELPER_SKIP_SIGNATURE_CHECK:-0}"
+UPDATE_TIMEZONE="${CODEX_UPDATE_HELPER_TIMEZONE:-America/New_York}"
+UPDATE_START_TIME=02:00
+UPDATE_END_TIME=03:00
+RESTART_POLICY=idle-only
+REOPEN=true
+RETRY_MINUTES=15
+readonly SETTINGS_PATH="${CODEX_UPDATE_HELPER_SETTINGS_PATH:-$HOME/Library/Application Support/Codex Update Helper/settings.plist}"
+readonly CHECK_STATE="${CODEX_UPDATE_HELPER_CHECK_STATE:-$HOME/Library/Application Support/Codex Update Helper/last-check}"
+readonly QUIT_HELPER="${CODEX_UPDATE_HELPER_QUIT_HELPER:-$HOME/Applications/Codex Update Helper.app/Contents/MacOS/codex-update-helper-quit}"
 readonly SERVICE_LABEL="dev.exprmntl.codex-update-helper"
 readonly LOCK_DIR="${TMPDIR:-/tmp}/${TOOL_NAME}-${UID}.lock"
 
 DRY_RUN=false
 FORCE=false
+SCHEDULED=false
 LOCK_HELD=false
 STAGED_APP=""
 STAGED_INFO=""
@@ -47,6 +57,8 @@ Usage:
   codex-update-helper run [--dry-run] [--force]
   codex-update-helper status
   codex-update-helper doctor
+  codex-update-helper settings
+  codex-update-helper config [show|set KEY VALUE ...|reset]
   codex-update-helper version
   codex-update-helper help
 
@@ -54,11 +66,91 @@ Commands:
   run       Enable Codex automatic updates and install a signed staged update.
   status    Show installed, staged, preference, process, and service state.
   doctor    Validate the app, signatures, updater cache, and service setup.
+  settings  Open the settings window.
+  config    Show, change, or reset persistent settings (changes apply next check).
 
 Options for run:
   --dry-run Show what would happen without changing preferences or quitting Codex.
-  --force   Bypass the idle-time guard. Signature and identity checks still apply.
+  --force   Bypass the time and idle guards; keep the configured restart policy.
+
+Automatic updates run only from 02:00 to 03:00 America/New_York by default.
+Settings: start-time, end-time, timezone, idle-minutes, retry-minutes,
+          restart-policy (idle-only or always), reopen (true or false).
 USAGE
+}
+
+load_settings() {
+  local values
+  local -a fields
+  if [[ -x $QUIT_HELPER ]]; then
+    values=$("$QUIT_HELPER" --config values) || { log_error 'Invalid settings; update canceled.'; return 1; }
+    fields=("${(@f)values}")
+    if (( ${#fields} != 7 )); then log_error 'Could not read settings from the native helper.'; return 1; fi
+    UPDATE_TIMEZONE=$fields[1]
+    UPDATE_START_TIME=$fields[2]
+    UPDATE_END_TIME=$fields[3]
+    MIN_IDLE_SECONDS=$(( 10#$fields[4] * 60 ))
+    RESTART_POLICY=$fields[5]
+    REOPEN=$fields[6]
+    RETRY_MINUTES=$fields[7]
+  elif [[ -e $SETTINGS_PATH ]]; then
+    log_error 'Saved settings exist but the native helper is missing; reinstall the helper.'
+    return 1
+  fi
+  # Keep existing environment overrides for development and older deployments.
+  UPDATE_TIMEZONE=${CODEX_UPDATE_HELPER_TIMEZONE:-$UPDATE_TIMEZONE}
+  MIN_IDLE_SECONDS=${CODEX_UPDATE_HELPER_MIN_IDLE_SECONDS:-$MIN_IDLE_SECONDS}
+  if [[ -n ${CODEX_UPDATE_HELPER_START_HOUR:-} ]]; then
+    printf -v UPDATE_START_TIME '%02d:00' "$CODEX_UPDATE_HELPER_START_HOUR"
+  fi
+  if [[ -n ${CODEX_UPDATE_HELPER_END_HOUR:-} ]]; then
+    printf -v UPDATE_END_TIME '%02d:00' "$CODEX_UPDATE_HELPER_END_HOUR"
+  fi
+}
+
+current_update_time() {
+  TZ="$UPDATE_TIMEZONE" /bin/date +%H:%M
+}
+
+time_minutes() {
+  local value=$1
+  [[ $value == [0-2][0-9]:[0-5][0-9] ]] || return 1
+  local hour=${value%:*} minute=${value#*:}
+  (( 10#$hour < 24 )) || [[ $value == 24:00 ]] || return 1
+  /bin/echo $(( 10#$hour * 60 + 10#$minute ))
+}
+
+in_update_window() {
+  local current start end
+  if [[ ! -f /usr/share/zoneinfo/$UPDATE_TIMEZONE ]] \
+      || ! start=$(time_minutes "$UPDATE_START_TIME") || ! end=$(time_minutes "$UPDATE_END_TIME") \
+      || (( start == end || start >= 1440 )); then
+    log_error "Invalid update timezone or window; refusing an automatic restart."
+    return 2
+  fi
+  current=$(time_minutes "$(current_update_time)") || return 2
+  if (( start < end )); then
+    (( current >= start && current < end ))
+  else
+    (( current >= start || current < end ))
+  fi
+}
+
+scheduled_check_due() {
+  [[ $SCHEDULED == true && $DRY_RUN != true ]] || return 0
+  local now previous=0 previous_settings='' snapshot
+  snapshot="$UPDATE_TIMEZONE|$UPDATE_START_TIME|$UPDATE_END_TIME|$MIN_IDLE_SECONDS|$RESTART_POLICY|$REOPEN|$RETRY_MINUTES"
+  now=$(/bin/date +%s)
+  if [[ -r $CHECK_STATE ]]; then
+    { read -r previous; read -r previous_settings; } < "$CHECK_STATE"
+  fi
+  if is_integer "$previous" && [[ $previous_settings == "$snapshot" ]] \
+      && (( now >= previous && now - previous < 10#$RETRY_MINUTES * 60 )); then
+    return 1
+  fi
+  /bin/mkdir -p "${CHECK_STATE:h}" || return 1
+  printf '%s\n%s\n' "$now" "$snapshot" > "$CHECK_STATE.tmp.$$" || return 1
+  /bin/mv "$CHECK_STATE.tmp.$$" "$CHECK_STATE" || return 1
 }
 
 read_plist_value() {
@@ -164,6 +256,22 @@ is_app_running() {
   /usr/bin/pgrep -a -f -x "$APP_EXECUTABLE" >/dev/null 2>&1
 }
 
+quit_guard_ready() {
+  [[ -x $QUIT_HELPER ]] && "$QUIT_HELPER" --check-accessibility >/dev/null 2>&1
+}
+
+running_app_pid() {
+  /usr/bin/pgrep -a -f -x "$APP_EXECUTABLE" 2>/dev/null
+}
+
+request_guarded_quit() {
+  "$QUIT_HELPER" --quit "$1" "$APP_EXECUTABLE" "$BUNDLE_ID" "$RESTART_POLICY"
+}
+
+wait_for_poll() {
+  /bin/sleep "$POLL_SECONDS"
+}
+
 idle_seconds() {
   if [[ -n ${CODEX_UPDATE_HELPER_IDLE_SECONDS_OVERRIDE:-} ]]; then
     /bin/echo "$CODEX_UPDATE_HELPER_IDLE_SECONDS_OVERRIDE"
@@ -257,7 +365,7 @@ poll_count() {
 
 open_app_if_needed() {
   local was_running=$1
-  if [[ $was_running == true ]] && ! is_app_running; then
+  if [[ $REOPEN == true && $was_running == true ]] && ! is_app_running; then
     if /usr/bin/open -a "$APP_PATH"; then
       log_info "Reopened Codex."
     else
@@ -274,6 +382,7 @@ run_update() {
     case $1 in
       --dry-run) DRY_RUN=true ;;
       --force) FORCE=true ;;
+      --scheduled) SCHEDULED=true ;;
       *) log_error "Unknown option: $1"; usage >&2; return 2 ;;
     esac
     shift
@@ -287,6 +396,17 @@ run_update() {
   if [[ ! -r $APP_INFO ]]; then
     log_error "Codex is not installed at $APP_PATH."
     return 1
+  fi
+
+  if [[ $FORCE != true ]]; then
+    local window_result=0
+    in_update_window || window_result=$?
+    if (( window_result == 2 )); then
+      return 1
+    elif (( window_result != 0 )); then
+      [[ $SCHEDULED == true ]] || log_info "Outside update window ($UPDATE_START_TIME–$UPDATE_END_TIME $UPDATE_TIMEZONE); deferring."
+      return 0
+    fi
   fi
 
   local bundle installed_build_value installed_version_value
@@ -307,6 +427,7 @@ run_update() {
     return 0
   fi
   trap release_lock EXIT INT TERM HUP
+  scheduled_check_due || return 0
 
   enable_automatic_updates || return 1
   find_newest_staged_update
@@ -323,7 +444,7 @@ run_update() {
   local was_running=false current_idle
   if is_app_running; then
     was_running=true
-    if [[ $FORCE != true ]]; then
+    if [[ $FORCE != true && $RESTART_POLICY == idle-only ]]; then
       current_idle=$(idle_seconds 2>/dev/null || true)
       if ! is_integer "$current_idle"; then
         log_info "Could not determine keyboard/mouse idle time; deferring the update safely."
@@ -336,12 +457,41 @@ run_update() {
     fi
 
     if [[ $DRY_RUN == true ]]; then
-      log_info "Would request a graceful Codex quit, wait for Sparkle, and reopen Codex."
+      log_info "Would request a graceful Codex quit (restart policy: $RESTART_POLICY; reopen: $REOPEN), then wait for Sparkle."
+      if ! quit_guard_ready; then
+        log_info "Unattended quit is not ready: install the local helper and enable its Accessibility permission."
+      fi
       return 0
     fi
 
-    log_info "Requesting a graceful Codex quit so Sparkle can install the update."
-    /usr/bin/osascript -e 'tell application id "com.openai.codex" to quit' >/dev/null 2>&1 || true
+    if ! quit_guard_ready; then
+      log_info "Unattended quit requires Codex Update Helper Accessibility permission; deferring before requesting a quit."
+      return 0
+    fi
+    # Signature verification can take several seconds. Recheck the window and
+    # keyboard/mouse activity immediately before asking the app to quit.
+    if [[ $FORCE != true ]]; then
+      in_update_window || { log_info "Update window closed; deferring."; return 0; }
+      if [[ $RESTART_POLICY == idle-only ]]; then
+        current_idle=$(idle_seconds 2>/dev/null || true)
+        if ! is_integer "$current_idle" || (( current_idle < MIN_IDLE_SECONDS )); then
+          log_info "The Mac became active; deferring."
+          return 0
+        fi
+      fi
+    fi
+    local app_pid quit_result=0
+    app_pid=$(running_app_pid) || return 0
+    if ! is_integer "$app_pid"; then
+      log_info "Could not identify one Codex process; deferring."
+      return 0
+    fi
+    log_info "Requesting a guarded graceful Codex quit so Sparkle can install the update."
+    request_guarded_quit "$app_pid" || quit_result=$?
+    if (( quit_result != 0 )); then
+      log_info "Codex quit was deferred by the guard (result $quit_result); no forced termination."
+      return 0
+    fi
 
     for attempt in {1..$(poll_count)}; do
       current_build_value=$(installed_build 2>/dev/null || true)
@@ -351,7 +501,7 @@ run_update() {
       if ! is_app_running; then
         break
       fi
-      /bin/sleep "$POLL_SECONDS"
+      wait_for_poll
     done
 
     current_build_value=$(installed_build 2>/dev/null || true)
@@ -375,7 +525,7 @@ run_update() {
       updated_build=$candidate_build
       break
     fi
-    /bin/sleep "$POLL_SECONDS"
+    wait_for_poll
   done
 
   if (( updated_build > installed_build_value )); then
@@ -392,6 +542,10 @@ run_update() {
 show_status() {
   /bin/echo "$TOOL_NAME $TOOL_VERSION"
   /bin/echo "App path: $APP_PATH"
+  /bin/echo "Update window: $UPDATE_START_TIME–$UPDATE_END_TIME $UPDATE_TIMEZONE"
+  /bin/echo "Restart policy: $RESTART_POLICY; idle: ${MIN_IDLE_SECONDS}s; reopen: $REOPEN; retry: ${RETRY_MINUTES}m"
+  /bin/echo "Settings: $SETTINGS_PATH"
+  /bin/echo "Unattended quit: $(quit_guard_ready && /bin/echo ready || /bin/echo 'needs helper Accessibility permission')"
 
   if [[ ! -r $APP_INFO ]]; then
     /bin/echo "Installed: not found"
@@ -490,9 +644,16 @@ run_doctor() {
   fi
 
   if service_is_loaded; then
-    doctor_check OK "Homebrew service $SERVICE_LABEL is loaded."
+    doctor_check OK "Service $SERVICE_LABEL is loaded."
   else
-    doctor_check WARN "Homebrew service $SERVICE_LABEL is not loaded."
+    doctor_check WARN "Service $SERVICE_LABEL is not loaded."
+    (( warnings++ ))
+  fi
+
+  if quit_guard_ready; then
+    doctor_check OK "Unattended quit guard has Accessibility permission."
+  else
+    doctor_check WARN "Install the local helper and enable Codex Update Helper in System Settings > Privacy & Security > Accessibility. Updates defer until it is ready."
     (( warnings++ ))
   fi
 
@@ -505,13 +666,22 @@ main() {
   (( $# > 0 )) && shift
 
   case $command in
+    run|status|doctor) load_settings || return 1 ;;
+  esac
+
+  case $command in
     run) run_update "$@" ;;
     status) show_status ;;
     doctor) run_doctor ;;
+    settings) "$QUIT_HELPER" --settings ;;
+    config) "$QUIT_HELPER" --config "$@" ;;
     version|--version|-v) /bin/echo "$TOOL_VERSION" ;;
     help|--help|-h) usage ;;
     *) log_error "Unknown command: $command"; usage >&2; return 2 ;;
   esac
 }
 
-main "$@"
+# Sourcing exposes functions for isolated tests without running an update.
+if [[ $ZSH_EVAL_CONTEXT != *:file ]]; then
+  main "$@"
+fi

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 - 2026-09-15
+
+- Limit automatic update application to 02:00–03:00 America/New_York, with quarter-hour retries and no daytime catch-up after sleep.
+- Add a dedicated native quit guard that defaults to accepting only Codex's scheduled-tasks-only warning and canceling warnings about active work or pending worktrees.
+- Defer before quitting when the guard lacks Accessibility permission; retain signature verification, graceful shutdown, and relaunch recovery.
+- Add a local app/LaunchAgent installer with backups, schedule and quit-flow tests, and real native-dialog fixture tests.
+- Add a native settings window and persistent `config show/set/reset` commands for the time window, timezone, idle time, retry interval, restart policy, and reopening.
+- Default to 02:00–03:00 Eastern, 15 minutes idle, 15-minute retries, no active work, and reopening; opt-in `always` allows graceful restarts during active work.
+- Read settings on each minute tick so changes apply without reinstalling; validate settings atomically and support windows crossing midnight.
+- Add native time pickers, a searchable timezone dropdown, duration menus, contextual restart guidance, and Restore defaults.
+- Add an original moon/update-arrow app icon, including all macOS icon sizes and Retina variants.
+
 ## 0.1.1 - 2026-08-20
 
 - Prevent an internal zsh loop variable from leaking into update logs.
