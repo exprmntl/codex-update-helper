@@ -19,6 +19,8 @@ if /bin/launchctl print "gui/$UID/$LABEL" 2>/dev/null | /usr/bin/grep -q 'state 
 fi
 /bin/launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 /usr/bin/ditto "$PROJECT_ROOT/build/Codex Update Helper.app" "$APP"
+# Refresh this app's metadata and icon after replacing a local build.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 /usr/bin/plutil -create xml1 "$PLIST"
 /usr/bin/plutil -insert Label -string "$LABEL" "$PLIST"
 /usr/bin/plutil -insert ProgramArguments -json '[]' "$PLIST"

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Update Helper</title>
+  <desc id="desc">A mint crescent moon and update arrow with a four-point star on a dark navy rounded square.</desc>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="#101F35"/>
+  <g fill="#83E9C1">
+    <path d="M766.84 354.23 A310 310 0 1 0 766.84 669.77 A240 240 0 1 1 766.84 354.23Z"/>
+    <path d="M702 336 815 306Q830 302 827 317L807 424Q804 439 793 428L697 353Q684 342 702 336Z"/>
+    <path d="M650 462Q658 503 662 507Q666 511 707 519Q666 527 662 531Q658 535 650 576Q642 535 638 531Q634 527 593 519Q634 511 638 507Q642 503 650 462Z"/>
+  </g>
+</svg>

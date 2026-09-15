@@ -11,6 +11,7 @@
 - Read settings on each minute tick so changes apply without reinstalling; validate settings atomically and support windows crossing midnight.
 - Add native time pickers, a searchable timezone dropdown, duration menus, contextual restart guidance, and Restore defaults.
 - Add an original moon/update-arrow app icon, including all macOS icon sizes and Retina variants.
+- Simplify the icon to a flat, editable two-color SVG with no gradients; build the macOS icon directly from the vector source.
 
 ## 0.1.1 - 2026-08-20
 

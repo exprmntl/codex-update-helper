@@ -1,6 +1,6 @@
 # Codex Update Helper
 
-<img src="assets/AppIcon.png" alt="Codex Update Helper moon and update arrow icon" width="112">
+<img src="assets/AppIcon.svg" alt="Codex Update Helper moon and update arrow icon" width="112">
 
 Keep the Codex desktop app current on macOS, even when it stays open for days.
 
@@ -123,6 +123,8 @@ zsh tests/native-ui.sh
 ```
 
 See [SECURITY.md](SECURITY.md) for the trust model and vulnerability reporting.
+
+The flat, two-color app icon is maintained as editable vector artwork in `assets/AppIcon.svg`. `scripts/build-icon.sh` uses macOS AppKit to render it and packages all icon sizes with `sips` and `iconutil`. `assets/AppIcon.png` is a portable preview.
 
 ## License
 
